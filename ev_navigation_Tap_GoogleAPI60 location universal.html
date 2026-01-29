@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>EV Navigation + Traffic + Energy + EVCS</title>
+  <meta charset="utf-8" />
+  <style>
+    html, body { height: 100%; margin: 0; font-family: Arial; }
+    #controls { padding: 6px; background: #fff; }
+    #map { height: calc(100vh - 80px); }
+
+    input, button { margin: 3px; padding: 6px; }
+
+    .floatingPanel {
+      position: absolute;
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.3);
+      display: none;
+      z-index: 1000;
+    }
+
+    .panelHeader {
+      background: #1a73e8;
+      color: white;
+      padding: 8px;
+      cursor: move;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      user-select: none;
+    }
+
+    .panelBody {
+      max-height: 60vh;
+      overflow-y: auto;
+      font-size: 12px;
+      padding: 6px;
+    }
+
+    .summaryBox {
+      background: #f7f9fc;
+      border: 1px solid #d0d7e2;
+      padding: 6px;
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+
+    .panelItem {
+      padding: 6px;
+      border-bottom: 1px solid #ddd;
+      cursor: pointer;
+    }
+
+    .panelItem:hover { background: #f1f8ff; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    th, td {
+      border: 1px solid #ccc;
+      padding: 6px;
+      vertical-align: top;
+    }
+
+    th {
+      background: #f0f0f0;
+      position: sticky;
+      top: 0;
+    }
+
+    .gm-instruction b { font-weight: bold; }
+    .toggleBtn { cursor: pointer; }
+  </style>
+</head>
+
+<body>
+
+<div id="controls">
+  <input id="source" placeholder="Enter source location">
+  <input id="destination" placeholder="Enter destination location">
+  <input id="soc" type="number" value="100">
+  <button onclick="useCurrentLocation()">Use My Current Location</button>
+  <button onclick="showRoute()">Show Route</button>
+  <button onclick="showEVCSAlongRoute()">Show EV Charging Along Route</button>
+</div>
+
+<div id="map"></div>
+
+<!-- SEGMENT PANEL -->
+<div id="segmentPanel" class="floatingPanel" style="top:120px; right:10px; width:520px;">
+  <div class="panelHeader" onmousedown="startDrag(event,this.parentElement)">
+    <div>
+      Direction-wise Energy & SoC<br>
+      <span style="font-size:11px;font-weight:normal;">
+        Traffic shown is route-level (estimated at segment level)
+      </span>
+    </div>
+    <span class="toggleBtn" onclick="togglePanel(event,this)">▼</span>
+  </div>
+  <div class="panelBody" id="segmentList"></div>
+</div>
+
+<!-- EVCS PANEL -->
+<div id="evcsPanel" class="floatingPanel" style="top:120px; left:10px; width:420px;">
+  <div class="panelHeader" onmousedown="startDrag(event,this.parentElement)">
+    EV Charging Stations
+    <span class="toggleBtn" onclick="togglePanel(event,this)">▼</span>
+  </div>
+  <div class="panelBody" id="evcsList"></div>
+</div>
+
+<script>
+let map, directionsService, directionsRenderer, trafficLayer, infoWindow;
+let routePolyline = [];
+let evcsMarkers = [];
+let evcsData = [];
+let seenPlaceIds = new Set();
+
+const ENERGY_PER_KM = 0.2;
+const BATTERY_CAPACITY = 50;
+
+/* MAP INIT */
+function initMap() {
+  map = new google.maps.Map(document.getElementById("map"), {
+    center: { lat: 22.57, lng: 88.36 },
+    zoom: 6
+  });
+
+  directionsService = new google.maps.DirectionsService();
+  directionsRenderer = new google.maps.DirectionsRenderer({ map });
+  trafficLayer = new google.maps.TrafficLayer();
+  infoWindow = new google.maps.InfoWindow();
+
+  new google.maps.places.Autocomplete(source);
+  new google.maps.places.Autocomplete(destination);
+}
+
+/* ✅ FIXED CURRENT LOCATION (MITIGATED FOR ALL DEVICES) */
+function useCurrentLocation() {
+  if (!navigator.geolocation) {
+    alert("Geolocation is not supported by this browser.");
+    return;
+  }
+
+  navigator.geolocation.getCurrentPosition(
+    p => {
+      source.value = `${p.coords.latitude},${p.coords.longitude}`;
+      map.setCenter({ lat: p.coords.latitude, lng: p.coords.longitude });
+      map.setZoom(14);
+    },
+    err => {
+      let msg = "Unable to get current location.\n\n";
+
+      if (err.code === 1)
+        msg += "❌ Permission denied.\nPlease allow location access.";
+      else if (err.code === 2)
+        msg += "❌ Location unavailable.";
+      else if (err.code === 3)
+        msg += "❌ Location request timed out.";
+
+      msg += "\n\nIMPORTANT:\n" +
+             "• Open this page via HTTPS\n" +
+             "• OR use http://localhost\n" +
+             "• Mobile browsers REQUIRE HTTPS";
+
+      alert(msg);
+    },
+    {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0
+    }
+  );
+}
+
+/* ROUTE */
+function showRoute() {
+  directionsService.route({
+    origin: source.value,
+    destination: destination.value,
+    travelMode: "DRIVING",
+    drivingOptions: {
+      departureTime: new Date(),
+      trafficModel: "bestguess"
+    }
+  }, (res, st) => {
+    if (st !== "OK") return alert(st);
+
+    directionsRenderer.setDirections(res);
+    trafficLayer.setMap(map);
+
+    routePolyline = res.routes[0].overview_path;
+    buildSegmentTable(res.routes[0]);
+  });
+}
+
+/* SEGMENT TABLE + TOTALS */
+function buildSegmentTable(route) {
+  const leg = route.legs[0];
+  const steps = leg.steps;
+
+  const routeTF = leg.duration_in_traffic
+    ? leg.duration_in_traffic.value / leg.duration.value
+    : 1;
+
+  let soc = parseFloat(document.getElementById("soc").value);
+  let totalEnergy = 0;
+
+  let html = `<div class="summaryBox">
+    <b>Total Distance:</b> ${(leg.distance.value/1000).toFixed(2)} km<br>`;
+
+  steps.forEach(s => {
+    const km = s.distance.value / 1000;
+    const localFactor = km < 0.5 ? 1.3 : (km < 1.5 ? 1.15 : 0.95);
+    totalEnergy += km * ENERGY_PER_KM * routeTF * localFactor;
+  });
+
+  const initialEnergy = BATTERY_CAPACITY * (soc / 100);
+
+  html += `<b>Total Energy Consumed:</b> ${totalEnergy.toFixed(2)} kWh<br>
+           <b>Total Energy Remaining:</b> ${(initialEnergy - totalEnergy).toFixed(2)} kWh
+           </div>
+           <table>
+           <tr>
+             <th>#</th><th>Turn</th><th>Dist (km)</th>
+             <th>Traffic</th><th>Energy (kWh)</th><th>SoC (%)</th>
+           </tr>`;
+
+  steps.forEach((s, i) => {
+    const km = s.distance.value / 1000;
+    const localFactor = km < 0.5 ? 1.3 : (km < 1.5 ? 1.15 : 0.95);
+    const tf = routeTF * localFactor;
+
+    const energy = km * ENERGY_PER_KM * tf;
+    soc -= (energy / BATTERY_CAPACITY) * 100;
+    soc = Math.max(0, soc);
+
+    const instr =
+      (s.html_instructions && s.html_instructions.trim())
+        ? s.html_instructions
+        : (s.instructions || "Continue straight");
+
+    const traffic =
+      tf > 1.4 ? "Heavy" : tf > 1.1 ? "Moderate" : "Light";
+
+    html += `<tr>
+      <td>${i+1}</td>
+      <td class="gm-instruction">${instr}</td>
+      <td>${km.toFixed(2)}</td>
+      <td>${traffic}</td>
+      <td>${energy.toFixed(2)}</td>
+      <td>${soc.toFixed(1)}</td>
+    </tr>`;
+  });
+
+  html += "</table>";
+  segmentList.innerHTML = html;
+  segmentPanel.style.display = "block";
+}
+
+/* EVCS — UNCHANGED */
+function showEVCSAlongRoute() {
+  if (!directionsRenderer.getDirections()) {
+    alert("Please click 'Show Route' first.");
+    return;
+  }
+
+  evcsMarkers.forEach(m => m.setMap(null));
+  evcsMarkers = [];
+  evcsData = [];
+  seenPlaceIds.clear();
+  evcsList.innerHTML = "";
+
+  const ps = new google.maps.places.PlacesService(map);
+  const initialEnergy =
+    BATTERY_CAPACITY * (parseFloat(document.getElementById("soc").value) / 100);
+
+  let pending = routePolyline.length;
+
+  routePolyline.forEach(p => {
+    ps.nearbySearch({
+      location: p,
+      radius: 8000,
+      keyword: "electric vehicle charging station"
+    }, (res, st) => {
+      if (st === "OK") {
+        res.forEach(place => {
+          if (seenPlaceIds.has(place.place_id)) return;
+          seenPlaceIds.add(place.place_id);
+
+          directionsService.route({
+            origin: source.value,
+            destination: place.geometry.location,
+            travelMode: "DRIVING",
+            drivingOptions: { departureTime: new Date(), trafficModel: "bestguess" }
+          }, (r, s) => {
+            if (s !== "OK") return;
+
+            const leg = r.routes[0].legs[0];
+            const km = leg.distance.value / 1000;
+            const tf = leg.duration_in_traffic
+              ? leg.duration_in_traffic.value / leg.duration.value
+              : 1;
+            const energy = km * ENERGY_PER_KM * tf;
+
+            evcsData.push({
+              place,
+              km,
+              energy,
+              remaining: initialEnergy - energy
+            });
+          });
+        });
+      }
+      if (--pending === 0) renderEVCS();
+    });
+  });
+}
+
+function renderEVCS() {
+  evcsData.sort((a, b) => a.energy - b.energy);
+
+  evcsData.forEach(d => {
+    const html = `
+      <b>${d.place.name}</b><br>
+      Distance: ${d.km.toFixed(2)} km<br>
+      Energy: ${d.energy.toFixed(2)} kWh<br>
+      Energy Remaining: ${d.remaining.toFixed(2)} kWh<br>
+      Rating: ⭐ ${d.place.rating || "N/A"}<br>
+      ${d.place.vicinity || ""}
+    `;
+
+    const marker = new google.maps.Marker({
+      map,
+      position: d.place.geometry.location,
+      icon: "https://maps.google.com/mapfiles/ms/icons/green-dot.png"
+    });
+
+    evcsMarkers.push(marker);
+
+    marker.addListener("click", () => {
+      infoWindow.setContent(html);
+      infoWindow.open(map, marker);
+    });
+
+    const div = document.createElement("div");
+    div.className = "panelItem";
+    div.innerHTML = html;
+    div.onclick = () => {
+      map.panTo(d.place.geometry.location);
+      map.setZoom(15);
+      google.maps.event.trigger(marker, "click");
+    };
+
+    evcsList.appendChild(div);
+  });
+
+  evcsPanel.style.display = "block";
+}
+
+/* PANEL UTILITIES */
+function togglePanel(e, el) {
+  e.stopPropagation();
+  const body = el.closest(".floatingPanel").querySelector(".panelBody");
+  body.style.display = body.style.display === "none" ? "block" : "none";
+  el.textContent = body.style.display === "none" ? "▼" : "▲";
+}
+
+function startDrag(e, panel) {
+  const r = panel.getBoundingClientRect();
+  const ox = e.clientX - r.left;
+  const oy = e.clientY - r.top;
+
+  function move(ev) {
+    panel.style.left = (ev.clientX - ox) + "px";
+    panel.style.top = (ev.clientY - oy) + "px";
+  }
+
+  function stop() {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", stop);
+  }
+
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", stop);
+}
+</script>
+
+<script
+  src="https://maps.googleapis.com/maps/api/js?key=AIzaSyBI75kCdx4hQsTpdO4gh3mvF7o5l5Nyqqk&libraries=places,geometry&callback=initMap"
+  async defer>
+</script>
+
+</body>
+</html>
